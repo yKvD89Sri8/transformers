@@ -56,14 +56,15 @@ def _make_causal_mask(input_ids_shape: torch.Size, dtype: torch.dtype, past_key_
     Make causal mask used for bi-directional self-attention.
     """
     batch_size, target_length = input_ids_shape
-    mask = torch.full((target_length, target_length), torch.finfo(dtype).min)
-    mask_cond = torch.arange(mask.size(-1))
-    intermediate_mask = mask_cond < (mask_cond + 1).view(mask.size(-1), 1)
-    mask.masked_fill_(intermediate_mask, 0)
-    mask = mask.to(dtype)
+
+    mask = torch.full((target_length, target_length), torch.finfo(dtype).min, dtype=dtype)
+    mask.triu_(diagonal=1)
 
     if past_key_values_length > 0:
-        mask = torch.cat([torch.zeros(target_length, past_key_values_length, dtype=dtype), mask], dim=-1)
+        past_key_values_mask = torch.full((target_length, past_key_values_length), torch.finfo(dtype).min, dtype=dtype)
+        past_key_values_mask.triu_(diagonal=past_key_values_mask - target_length + 1)
+        mask = torch.cat([past_key_values_mask, mask], dim=-1)
+
     expanded_mask = mask[None, None, :, :].expand(batch_size, 1, target_length, target_length + past_key_values_length)
     return expanded_mask
 
@@ -120,10 +121,8 @@ def build_alibi_tensor(attention_mask: torch.Tensor, n_head: int, dtype, device)
     # This is more or less identical to T5's relative position bias:
     # https://github.com/huggingface/transformers/blob/f681437203baa7671de3174b0fa583c349d9d5e1/src/transformers/models/t5/modeling_t5.py#L527
     # batch_size = 1, n_head = n_head, query_length
-
-    arange_tensor = (attention_mask.cumsum(-1)[:, None, :].to(device) - 1) * attention_mask[:, None]
-    alibi = slopes.unsqueeze(-1) * arange_tensor
-    alibi = alibi * attention_mask[:, None]
+    arange_tensor = ((attention_mask.cumsum(-1) - 1) * attention_mask)[:, None, :]
+    alibi = slopes[..., None] * arange_tensor
     return alibi.reshape(alibi.shape[0] * n_head, 1, -1).to(dtype)
 
 
@@ -305,7 +304,6 @@ class BloomAttention(nn.Module):
         attn_weights = (attention_scores * self.layer_number) + attention_mask
         attn_weights = torch.max(attn_weights, torch.tensor(torch.finfo(attn_weights.dtype).min))
         attention_probs = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(input_dtype)
-        attention_probs = attention_probs * (~attention_mask.bool())
         # [batch_size, num_heads, q_length, k_length]
         attention_probs = self.attention_dropout(attention_probs)
 
@@ -617,7 +615,6 @@ class BloomModel(BloomPreTrainedModel):
         input_ids=None,
         past_key_values=None,
         attention_mask=None,
-        position_ids=None,
         head_mask=None,
         inputs_embeds=None,
         use_cache=None,
@@ -637,6 +634,7 @@ class BloomModel(BloomPreTrainedModel):
         elif input_ids is not None:
             input_shape = input_ids.size()
             input_ids = input_ids.view(-1, input_shape[-1])
+            input_shape = input_ids.size()
         elif inputs_embeds is not None:
             input_shape = inputs_embeds.size()[:-1]
         else:
@@ -672,6 +670,8 @@ class BloomModel(BloomPreTrainedModel):
         if attention_mask is None:
             attention_mask = torch.ones((hidden_states.shape[0], current_sequence_length), device=hidden_states.device)
         else:
+            attention_mask_shape = attention_mask.size()
+            attention_mask = attention_mask.view(-1, attention_mask_shape[-1])
             attention_mask = attention_mask.to(hidden_states.device)
 
         alibi = build_alibi_tensor(attention_mask, self.n_head, hidden_states.dtype, hidden_states.device)
@@ -772,16 +772,7 @@ class BloomForCausalLM(BloomPreTrainedModel):
             input_ids = input_ids[:, -1].unsqueeze(-1)
 
         attention_mask = kwargs.get("attention_mask", None)
-        position_ids = kwargs.get("position_ids", None)
 
-        if attention_mask is not None and position_ids is None:
-            # create position_ids on the fly for batch generation
-            position_ids = attention_mask.long().cumsum(-1) - 1
-            position_ids.masked_fill_(attention_mask == 0, 1)
-            if past:
-                position_ids = position_ids[:, -1].unsqueeze(-1)
-        else:
-            position_ids = None
         return {
             "input_ids": input_ids,
             "past_key_values": past,
@@ -801,7 +792,6 @@ class BloomForCausalLM(BloomPreTrainedModel):
         input_ids=None,
         past_key_values=None,
         attention_mask=None,
-        position_ids=None,
         head_mask=None,
         inputs_embeds=None,
         labels=None,
@@ -822,7 +812,6 @@ class BloomForCausalLM(BloomPreTrainedModel):
             input_ids,
             past_key_values=past_key_values,
             attention_mask=attention_mask,
-            position_ids=position_ids,
             head_mask=head_mask,
             inputs_embeds=inputs_embeds,
             use_cache=use_cache,
@@ -907,7 +896,6 @@ class BloomForSequenceClassification(BloomPreTrainedModel):
         input_ids=None,
         past_key_values=None,
         attention_mask=None,
-        position_ids=None,
         head_mask=None,
         inputs_embeds=None,
         labels=None,
@@ -929,7 +917,6 @@ class BloomForSequenceClassification(BloomPreTrainedModel):
             input_ids,
             past_key_values=past_key_values,
             attention_mask=attention_mask,
-            position_ids=position_ids,
             head_mask=head_mask,
             inputs_embeds=inputs_embeds,
             use_cache=use_cache,
