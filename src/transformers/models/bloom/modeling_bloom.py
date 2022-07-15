@@ -80,7 +80,8 @@ def _expand_mask(mask: torch.Tensor, dtype: torch.dtype, tgt_len: int = None):
 
     inverted_mask = 1.0 - expanded_mask
 
-    return inverted_mask.masked_fill_(inverted_mask.to(torch.bool), torch.finfo(dtype).min)
+    inverted_mask.masked_fill_(inverted_mask.to(torch.bool), torch.finfo(dtype).min)
+    return inverted_mask
 
 
 def build_alibi_tensor(attention_mask: torch.Tensor, n_head: int, dtype, device) -> torch.Tensor:
