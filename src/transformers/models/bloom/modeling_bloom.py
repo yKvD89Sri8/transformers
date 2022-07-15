@@ -36,7 +36,7 @@ from .configuration_bloom import BloomConfig
 
 logger = logging.get_logger(__name__)
 
-_CHECKPOINT_FOR_DOC = "bigscience/Bloom"
+_CHECKPOINT_FOR_DOC = "bigscience/bloom"
 _CONFIG_FOR_DOC = "BloomConfig"
 _TOKENIZER_FOR_DOC = "BloomTokenizerFast"
 
@@ -53,7 +53,7 @@ BLOOM_PRETRAINED_MODEL_ARCHIVE_LIST = [
 
 def _make_causal_mask(input_ids_shape: torch.Size, dtype: torch.dtype, past_key_values_length: int = 0):
     """
-    Make causal mask used for bi-directional self-attention.
+    Make causal mask used for self-attention.
     """
     batch_size, target_length = input_ids_shape
 
@@ -73,14 +73,14 @@ def _expand_mask(mask: torch.Tensor, dtype: torch.dtype, tgt_len: int = None):
     """
     Expands attention_mask from `[bsz, seq_len]` to `[bsz, 1, tgt_seq_len, src_seq_len]`.
     """
-    batch_size, source_length = mask.size()
+    batch_size, source_length = mask.shape
     tgt_len = tgt_len if tgt_len is not None else source_length
 
     expanded_mask = mask[:, None, None, :].expand(batch_size, 1, tgt_len, source_length).to(dtype)
 
     inverted_mask = 1.0 - expanded_mask
 
-    return inverted_mask.masked_fill(inverted_mask.to(torch.bool), torch.finfo(dtype).min)
+    return inverted_mask.masked_fill_(inverted_mask.to(torch.bool), torch.finfo(dtype).min)
 
 
 def build_alibi_tensor(attention_mask: torch.Tensor, n_head: int, dtype, device) -> torch.Tensor:
@@ -229,7 +229,8 @@ class BloomAttention(nn.Module):
 
         # Layer-wise attention scaling
         self.layer_number = max(1, layer_number)
-        self.norm_factor = math.sqrt(self.head_dim) * self.layer_number
+        self.inv_norm_factor = 1.0 / math.sqrt(self.head_dim) * self.layer_number
+        self.beta = 1.0 / self.layer_number
 
         self.query_key_value = nn.Linear(self.hidden_size, 3 * self.hidden_size, bias=True)
         self.dense = nn.Linear(self.hidden_size, self.hidden_size)
@@ -239,26 +240,24 @@ class BloomAttention(nn.Module):
         """
         Split the last dimension into (num_heads, head_dim)
         """
-        new_tensor_shape = fused_qkv.size()[:-1] + (self.num_heads, 3 * self.head_dim)
-        # new_tensor_shape = (fused_qkv.size(1), fused_qkv.size(0)*fused_qkv.size(2), fused_qkv.size(-1))
-        # fused_qkv = fused_qkv.transpose(1, 0)
-        fused_qkv = fused_qkv.reshape(*new_tensor_shape)
-        # fused_qkv = fused_qkv.permute(0, 2, 1, 3)
+        fused_qkv = fused_qkv.reshape(*fused_qkv.size()[:-1], self.num_heads, 3 * self.head_dim)
         return torch.split(fused_qkv, self.head_dim, -1)
 
     def _merge_heads(self, x):
         # What we want to achieve is:
         # batch_size * num_heads, seq_len, head_dim -> batch_size, seq_len, num_heads * head_dim
+        batch_size_and_num_heads, seq_len, _ = x.shape
+        batch_size = batch_size_and_num_heads // self.num_heads
 
         # First view to decompose the batch size
         # batch_size*num_heads, seq_len, head_dim -> batch_size, num_heads, seq_len, head_dim
-        x = x.view(x.size(0) // self.num_heads, self.num_heads, x.size(1), self.head_dim)
+        x = x.view(batch_size, self.num_heads, seq_len, self.head_dim)
 
         # batch_size, num_heads, seq_len, head_dim -> batch_size, seq_len, num_heads, head_dim
         x = x.permute(0, 2, 1, 3)
 
         # batch_size, seq_len, num_heads, head_dim -> batch_size, seq_len, num_heads * head_dim
-        return x.reshape(x.size(0), x.size(1), self.num_heads * self.head_dim)
+        return x.reshape(batch_size, seq_len, self.num_heads * self.head_dim)
 
     def forward(
         self,
@@ -288,21 +287,22 @@ class BloomAttention(nn.Module):
         else:
             present = None
 
-        beta = 1.0 / self.layer_number
+        batch_size, q_length, _, _= query_layer.shape
+        _, kv_length, _, _ = key_layer.shape
+
 
         # # [batch_size*num_heads, head_dim, q_length] x [batch_size*num_heads, head_dim, k_length] -> [batch_size*num_heads, q_length, k_length]
-        matmul_result = (1.0 / self.norm_factor) * torch.bmm(
-            query_layer.transpose(1, 2).reshape(-1, query_layer.shape[1], query_layer.shape[3]),
-            key_layer.permute(0, 2, 3, 1).reshape(-1, key_layer.shape[3], key_layer.shape[1]),
-        ) + beta * alibi
+        matmul_result = self.inv_norm_factor * torch.bmm(
+            query_layer.transpose(1, 2).reshape(batch_size * self.num_heads, q_length, self.head_dim),
+            key_layer.permute(0, 2, 3, 1).reshape(batch_size * self.num_heads, self.head_dim, kv_length),
+        ) + self.beta * alibi
 
         # change view to [batch_size, num_heads, q_length, k_length]
-        attention_scores = matmul_result.view(-1, self.num_heads, matmul_result.size(1), matmul_result.size(2))
+        attention_scores = matmul_result.view(batch_size, self.num_heads, q_length, kv_length)
 
         # We replace the scaled softmax by just a few line of code - [batch_size, num_heads, q_length, k_length]
         input_dtype = attention_scores.dtype
         attn_weights = (attention_scores * self.layer_number) + attention_mask
-        attn_weights = torch.max(attn_weights, torch.tensor(torch.finfo(attn_weights.dtype).min))
         attention_probs = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(input_dtype)
         # [batch_size, num_heads, q_length, k_length]
         attention_probs = self.attention_dropout(attention_probs)
@@ -311,11 +311,11 @@ class BloomAttention(nn.Module):
             attention_probs = attention_probs * head_mask
 
         # change view [batch_size x num_heads, q_length, k_length]
-        attention_probs_reshaped = attention_probs.view(*matmul_result.shape)
+        attention_probs_reshaped = attention_probs.view(batch_size * self.num_heads, q_length, kv_length)
 
         # matmul: [batch_size * num_heads, q_length, head_dim]
         context_layer = torch.bmm(
-            attention_probs_reshaped, value_layer.transpose(1, 2).reshape(-1, value_layer.size(1), value_layer.size(3))
+            attention_probs_reshaped, value_layer.transpose(1, 2).reshape(batch_size * self.num_heads, kv_length, self.head_dim)
         )
 
         # change view [batch_size, num_heads, q_length, head_dim]
