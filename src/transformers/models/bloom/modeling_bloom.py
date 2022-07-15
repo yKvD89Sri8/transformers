@@ -287,15 +287,18 @@ class BloomAttention(nn.Module):
         else:
             present = None
 
-        batch_size, q_length, _, _= query_layer.shape
+        batch_size, q_length, _, _ = query_layer.shape
         _, kv_length, _, _ = key_layer.shape
 
-
         # # [batch_size*num_heads, head_dim, q_length] x [batch_size*num_heads, head_dim, k_length] -> [batch_size*num_heads, q_length, k_length]
-        matmul_result = self.inv_norm_factor * torch.bmm(
-            query_layer.transpose(1, 2).reshape(batch_size * self.num_heads, q_length, self.head_dim),
-            key_layer.permute(0, 2, 3, 1).reshape(batch_size * self.num_heads, self.head_dim, kv_length),
-        ) + self.beta * alibi
+        matmul_result = (
+            self.inv_norm_factor
+            * torch.bmm(
+                query_layer.transpose(1, 2).reshape(batch_size * self.num_heads, q_length, self.head_dim),
+                key_layer.permute(0, 2, 3, 1).reshape(batch_size * self.num_heads, self.head_dim, kv_length),
+            )
+            + self.beta * alibi
+        )
 
         # change view to [batch_size, num_heads, q_length, k_length]
         attention_scores = matmul_result.view(batch_size, self.num_heads, q_length, kv_length)
@@ -315,7 +318,8 @@ class BloomAttention(nn.Module):
 
         # matmul: [batch_size * num_heads, q_length, head_dim]
         context_layer = torch.bmm(
-            attention_probs_reshaped, value_layer.transpose(1, 2).reshape(batch_size * self.num_heads, kv_length, self.head_dim)
+            attention_probs_reshaped,
+            value_layer.transpose(1, 2).reshape(batch_size * self.num_heads, kv_length, self.head_dim),
         )
 
         # change view [batch_size, num_heads, q_length, head_dim]
