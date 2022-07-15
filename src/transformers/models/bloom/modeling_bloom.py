@@ -62,7 +62,7 @@ def _make_causal_mask(input_ids_shape: torch.Size, dtype: torch.dtype, past_key_
 
     if past_key_values_length > 0:
         past_key_values_mask = torch.full((target_length, past_key_values_length), torch.finfo(dtype).min, dtype=dtype)
-        past_key_values_mask.triu_(diagonal=past_key_values_mask - target_length + 1)
+        past_key_values_mask.triu_(diagonal=past_key_values_length - target_length + 1)
         mask = torch.cat([past_key_values_mask, mask], dim=-1)
 
     expanded_mask = mask[None, None, :, :].expand(batch_size, 1, target_length, target_length + past_key_values_length)
