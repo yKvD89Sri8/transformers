@@ -77,11 +77,11 @@ def _expand_mask(mask: torch.Tensor, dtype: torch.dtype, tgt_len: int = None):
     tgt_len = tgt_len if tgt_len is not None else source_length
 
     expanded_mask = mask[:, None, None, :].expand(batch_size, 1, tgt_len, source_length).to(dtype)
+    return expanded_mask
 
-    inverted_mask = 1.0 - expanded_mask
-
+    # inverted_mask = 1.0 - expanded_mask
     # inverted_mask.masked_fill_(inverted_mask.to(torch.bool), torch.finfo(dtype).min)
-    return inverted_mask
+    # return inverted_mask
 
 
 def build_alibi_tensor(attention_mask: torch.Tensor, n_head: int, dtype, device) -> torch.Tensor:
