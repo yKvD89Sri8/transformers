@@ -57,11 +57,11 @@ def _make_causal_mask(input_ids_shape: torch.Size, dtype: torch.dtype, past_key_
     """
     batch_size, target_length = input_ids_shape
 
-    mask = torch.full((target_length, target_length), torch.finfo(dtype).min, dtype=dtype)
+    mask = torch.ones((target_length, target_length), dtype=dtype)
     mask.triu_(diagonal=1)
 
     if past_key_values_length > 0:
-        past_key_values_mask = torch.full((target_length, past_key_values_length), torch.finfo(dtype).min, dtype=dtype)
+        past_key_values_mask = torch.ones((target_length, past_key_values_length), dtype=dtype)
         past_key_values_mask.triu_(diagonal=past_key_values_length - target_length + 1)
         mask = torch.cat([past_key_values_mask, mask], dim=-1)
 
@@ -80,7 +80,7 @@ def _expand_mask(mask: torch.Tensor, dtype: torch.dtype, tgt_len: int = None):
 
     inverted_mask = 1.0 - expanded_mask
 
-    inverted_mask.masked_fill_(inverted_mask.to(torch.bool), torch.finfo(dtype).min)
+    # inverted_mask.masked_fill_(inverted_mask.to(torch.bool), torch.finfo(dtype).min)
     return inverted_mask
 
 
@@ -292,13 +292,12 @@ class BloomAttention(nn.Module):
         _, kv_length, _, _ = key_layer.shape
 
         # # [batch_size*num_heads, head_dim, q_length] x [batch_size*num_heads, head_dim, k_length] -> [batch_size*num_heads, q_length, k_length]
-        matmul_result = (
-            self.inv_norm_factor
-            * torch.bmm(
-                query_layer.transpose(1, 2).reshape(batch_size * self.num_heads, q_length, self.head_dim),
-                key_layer.permute(0, 2, 3, 1).reshape(batch_size * self.num_heads, self.head_dim, kv_length),
-            )
-            + self.beta * alibi
+        matmul_result = torch.baddbmm(
+            input=alibi,
+            batch1=query_layer.transpose(1, 2).reshape(batch_size * self.num_heads, q_length, self.head_dim),
+            batch2=key_layer.permute(0, 2, 3, 1).reshape(batch_size * self.num_heads, self.head_dim, kv_length),
+            beta=self.beta,
+            alpha=self.inv_norm_factor
         )
 
         # change view to [batch_size, num_heads, q_length, k_length]
@@ -306,7 +305,7 @@ class BloomAttention(nn.Module):
 
         # We replace the scaled softmax by just a few line of code - [batch_size, num_heads, q_length, k_length]
         input_dtype = attention_scores.dtype
-        attn_weights = (attention_scores * self.layer_number) + attention_mask
+        attn_weights = torch.masked_fill(attention_scores * self.layer_number, attention_mask, torch.finfo(input_dtype).min)
         attention_probs = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(input_dtype)
         # [batch_size, num_heads, q_length, k_length]
         attention_probs = self.attention_dropout(attention_probs)
@@ -595,7 +594,7 @@ class BloomModel(BloomPreTrainedModel):
             # [bsz, seq_len] -> [bsz, 1, tgt_seq_len, src_seq_len]
             expanded_attn_mask = _expand_mask(attention_mask, inputs_embeds.dtype, tgt_len=input_shape[-1])
             combined_attention_mask = (
-                expanded_attn_mask if combined_attention_mask is None else expanded_attn_mask + combined_attention_mask
+                expanded_attn_mask if combined_attention_mask is None else expanded_attn_mask * combined_attention_mask
             )
 
         return combined_attention_mask
