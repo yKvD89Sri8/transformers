@@ -583,7 +583,7 @@ class BloomModel(BloomPreTrainedModel):
         combined_attention_mask = None
         if input_shape[-1] > 1:
             combined_attention_mask = _make_causal_mask(
-                input_shape, attention_mask.device, past_key_values_length=past_key_values_length
+                input_shape, torch.bool, past_key_values_length=past_key_values_length
             )
 
         if attention_mask is not None:
