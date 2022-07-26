@@ -76,12 +76,8 @@ def _expand_mask(mask: torch.Tensor, dtype: torch.dtype, tgt_len: int = None):
     batch_size, source_length = mask.shape
     tgt_len = tgt_len if tgt_len is not None else source_length
 
-    expanded_mask = mask[:, None, None, :].expand(batch_size, 1, tgt_len, source_length).to(dtype)
+    expanded_mask = mask[:, None, None, :].to(dtype).expand(batch_size, 1, tgt_len, source_length)
     return ~expanded_mask
-
-    # inverted_mask = 1.0 - expanded_mask
-    # inverted_mask.masked_fill_(inverted_mask.to(torch.bool), torch.finfo(dtype).min)
-    # return inverted_mask
 
 
 def build_alibi_tensor(attention_mask: torch.Tensor, n_head: int, dtype, device) -> torch.Tensor:
@@ -587,8 +583,8 @@ class BloomModel(BloomPreTrainedModel):
         combined_attention_mask = None
         if input_shape[-1] > 1:
             combined_attention_mask = _make_causal_mask(
-                input_shape, torch.bool, past_key_values_length=past_key_values_length
-            ).to(attention_mask.device)
+                input_shape, attention_mask.device, past_key_values_length=past_key_values_length
+            )
 
         if attention_mask is not None:
             # [bsz, seq_len] -> [bsz, 1, tgt_seq_len, src_seq_len]
